@@ -1,0 +1,455 @@
+#!/bin/sh
+
+. /usr/share/libubox/jshn.sh
+export LC_ALL=C
+umask 077
+state=/tmp/luci-wifi-lab
+
+reply() {
+	json_init
+	json_add_string "$1" "$2"
+	json_dump
+}
+
+mac() {
+	[ "${#1}" -eq 17 ] && printf '%s\n' "$1" | grep -Eq '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'
+}
+
+run() {
+	work=$(mktemp -d "$state/job.XXXXXX") || return
+	printf '%s\n' "$work" > "$state/current"
+	printf '%s\n' "$mode" > "$work/mode"
+	printf '%s\n' "$bssid" > "$work/bssid"
+	printf '%s\n' 'Подготовка' > "$work/result"
+	mon="${iface}mon"
+	trap 'exit 1' HUP INT TERM
+	trap 'finish' EXIT
+	if [ "$mode" = details ] || [ "$mode" = survey ]; then
+		printf '%s\n' 'Получение параметров точек и WPS' > "$work/result"
+		timeout -k 2 20 iw dev "$iface" scan > "$work/details" 2>"$work/error" 9>&- &
+		capture=$!
+		while kill -0 "$capture" 2>/dev/null; do
+			if [ -f "$work/stop" ]; then
+				timeout -k 1 2 iw dev "$iface" scan abort >/dev/null 2>&1
+				stop_children
+				printf '%s\n' 'Сканирование остановлено' > "$work/result"
+				return
+			fi
+			sleep 0.2
+		done
+		wait "$capture" 2>/dev/null
+		result=$?
+		capture=
+		if [ "$result" -eq 0 ]; then
+			cp "$work/details" "$state/details.new" && mv "$state/details.new" "$state/details"
+		else
+			rm -f "$state/details"
+		fi
+		if [ "$mode" = details ]; then
+			printf 'Скан параметров iw: код %s\n' "$result" > "$work/result"
+			return
+		fi
+		[ ! -f "$work/stop" ] || return
+	fi
+
+	# The interface name and its initial absence were checked under the job lock.
+	restore=1
+	timeout -k 2 20 airmon-ng start "$iface" ${channel:+"$channel"} >"$work/monitor" 2>&1
+	iw dev "$mon" info | grep -q 'type monitor' || {
+		printf '%s\n' 'Не удалось создать интерфейс мониторинга' > "$work/result"
+		return
+	}
+	if [ -n "$channel" ] && ! on_channel; then
+		printf '%s\n' 'Интерфейс не перешёл на выбранный канал' > "$work/result"
+		return
+	fi
+	if [ -f "$work/stop" ]; then
+		printf '%s\n' 'Операция остановлена' > "$work/result"
+		return
+	fi
+	set -- --background 1 --write-interval 2 -w "$work/capture"
+	if [ "$mode" = survey ]; then
+		set -- "$@" --band "$band" --output-format pcap,csv
+	else
+		set -- "$@" -c "$channel" --bssid "$bssid" --output-format pcap,csv
+	fi
+	(
+		ulimit -f 16384
+		if [ "$mode" = survey ]; then
+			exec timeout -k 3 "$((seconds + 3))" airodump-ng "$@" "$mon"
+		fi
+		exec airodump-ng "$@" "$mon"
+	) \
+		</dev/null >/dev/null 2>"$work/capture-error" 9>&- &
+	capture=$!
+	printf '%s\n' "Мониторинг: $mon" > "$work/result"
+	remaining=$seconds
+	[ "$mode" != capture ] || : > "$work/accept-deauth"
+	while { [ "$mode" != survey ] || [ "$remaining" -gt 0 ]; } &&
+		[ ! -f "$work/stop" ] && kill -0 "$capture" 2>/dev/null; do
+		if [ "$mode" = capture ] && [ -f "$work/deauth-request" ] && [ -z "$station" ]; then
+			read -r station count < "$work/deauth-request"
+			printf '%s\n' 'Запрос deauth принят' > "$work/result"
+		fi
+		if [ -n "$station" ] && [ -z "$sent" ] && on_channel &&
+			{ [ "$station" = all ] || client_seen; }; then
+			sent=1
+			printf '%s\n' 'Deauth запущен. Захват продолжается.' > "$work/result"
+			set -- --ignore-negative-one -0 "$count" -a "$bssid"
+			[ "$station" = all ] || set -- "$@" -c "$station"
+			timeout -k 2 12 aireplay-ng "$@" "$mon" </dev/null >"$work/replay" 2>&1 9>&- &
+			replay=$!
+		fi
+		if [ "$mode" != survey ] && [ "$((remaining % 5))" -eq 0 ] &&
+			[ -s "$work/capture-01.cap" ] && [ ! -f "$work/handshake" ] &&
+			{ [ -z "$verifier" ] || ! kill -0 "$verifier" 2>/dev/null; }; then
+			(verify_capture) 9>&- &
+			verifier=$!
+		fi
+		for tick in 1 2 3 4 5; do
+			[ ! -f "$work/stop" ] || break
+			sleep 0.2
+		done
+		remaining=$((remaining - 1))
+	done
+	if [ ! -f "$work/stop" ] && { [ "$mode" != survey ] || [ "$remaining" -gt 0 ]; } &&
+		! kill -0 "$capture" 2>/dev/null; then
+		wait "$capture" 2>/dev/null
+		capture_status=$?
+		capture=
+	fi
+	rm -f "$work/accept-deauth"
+	stop_children
+	restore_radio
+	wait_verifier
+	if [ "$mode" = survey ] && [ -s "$work/capture-01.csv" ]; then
+		cp "$work/capture-01.csv" "$state/survey.new" && mv "$state/survey.new" "$state/survey"
+		rm -f "$state/wps"
+		if [ -s "$work/capture-01.cap" ] && [ ! -f "$work/stop" ]; then
+			printf '%s\n' 'Проверка WPS по кадрам точек доступа' > "$work/result"
+			od -An -v -tu1 "$work/capture-01.cap" | awk -f /usr/share/wifi-lab/wps.awk > "$state/wps.new" &&
+				mv "$state/wps.new" "$state/wps"
+			rm -f "$work/capture-01.cap" "$state/wps.new"
+		else
+			rm -f "$work/capture-01.cap"
+		fi
+	fi
+	if [ -n "$capture_status" ]; then
+		printf 'Не удалось продолжить запись airodump-ng (код %s)\n' "$capture_status" > "$work/result"
+	elif [ ! -f "$work/stop" ] && [ "$mode" = survey ] && [ ! -s "$work/capture-01.csv" ]; then
+		printf '%s\n' 'Не удалось получить результаты сканирования' > "$work/result"
+	elif { [ "$mode" = deauth ] || [ -f "$work/deauth-request" ]; } && [ -z "$sent" ]; then
+		printf '%s\n' 'Условия отправки не выполнены до окончания захвата. Deauth не отправлен.' > "$work/result"
+	elif [ -n "$sent" ]; then
+		printf '%s\n' 'Deauth запущен. Смотрите журнал отправки и результат проверки CAP.' > "$work/result"
+	elif [ -f "$work/stop" ]; then
+		printf '%s\n' 'Операция остановлена' > "$work/result"
+	else
+		printf '%s\n' 'Сбор завершён' > "$work/result"
+	fi
+	verify_capture
+	report_restore_failure
+}
+
+verify_capture() {
+	if [ -s "$work/capture-01.cap" ] && mac "$bssid"; then
+		printf '%s\n' verification-only > "$work/check"
+		timeout -k 2 8 aircrack-ng -w "$work/check" "$work/capture-01.cap" \
+			</dev/null 2>&1 | awk -v target="$bssid" '
+				tolower($0) ~ target && /handshake/ {print}
+				/Packets contained no EAPOL|Read [0-9]+ packets/ {print}
+			' > "$work/verification.new"
+		if grep -Eq 'WPA \([1-9][0-9]* handshake' "$work/verification.new"; then
+			: > "$work/handshake"
+		fi
+		mv "$work/verification.new" "$work/verification"
+		rm -f "$work/check"
+	fi
+}
+
+on_channel() {
+	iw dev "$mon" info | awk -v expected="$channel" '$1 == "channel" && $2 == expected {found=1} END {exit !found}'
+}
+
+ap_restored() {
+	[ "$(ubus call "hostapd.$iface" get_status | jsonfilter -e '@.status')" = ENABLED ] &&
+	iw dev "$iface" info | awk -v original="$original_channel" -v mac="$original_mac" '
+		$1 == "type" && $2 == "AP" {ap=1}
+		$1 == "channel" && $2 == original {channel=1}
+		$1 == "addr" && $2 == mac {address=1}
+		END {exit !(ap && address && (channel || original == ""))}
+	'
+}
+
+client_seen() {
+	awk -F, -v ap="$bssid" -v sta="$station" '
+		/^Station MAC/ { clients=1; next }
+		clients {
+			gsub(/[[:space:]]/, "", $6)
+			if (tolower($1) == sta && tolower($6) == ap && $5+0 > 0) found=1
+		}
+		END {exit !found}
+	' "$work/capture-01.csv" 2>/dev/null
+}
+
+stop_children() {
+	for child in "$replay" "$capture"; do
+		[ -n "$child" ] && kill -TERM "$child" 2>/dev/null
+	done
+	for child in "$replay" "$capture"; do
+		[ -n "$child" ] && wait "$child" 2>/dev/null
+	done
+	replay= capture=
+}
+
+wait_verifier() {
+	[ -z "$verifier" ] || wait "$verifier" 2>/dev/null
+	verifier=
+}
+
+restore_radio() {
+	if [ -n "$restore" ]; then
+		: > "$work/restoring"
+		if iw dev "$mon" info >/dev/null 2>&1; then
+			timeout -k 2 20 airmon-ng stop "$mon" >>"$work/monitor" 2>&1
+			iw dev "$mon" info >/dev/null 2>&1 && iw dev "$mon" del
+		fi
+		if [ "$original_type" = AP ]; then
+			timeout -k 2 15 wifi down "$radio" >>"$work/monitor" 2>&1
+			sleep 2
+			timeout -k 2 15 wifi up "$radio" >>"$work/monitor" 2>&1
+			for attempt in 1 2 3 4 5; do
+				ap_restored && break
+				sleep 2
+			done
+			ap_restored || restore_failed=1
+		fi
+		restore=
+		rm -f "$work/restoring"
+	fi
+}
+
+report_restore_failure() {
+	[ -z "$restore_failed" ] || {
+		printf '\nНе удалось подтвердить восстановление точки доступа %s.\n' "$iface" >>"$work/result"
+		restore_failed=
+	}
+}
+
+finish() {
+	stop_children
+	restore_radio
+	wait_verifier
+	report_restore_failure
+	rm -f "$work/stop"
+}
+
+add_file() {
+	[ -f "$2" ] && json_add_string "$1" "$(head -c "${3:-65536}" "$2")"
+}
+
+case "$1:$2" in
+	list:)
+		echo '{"status":{},"start":{"iface":"","mode":"","band":"","seconds":0,"channel":0,"bssid":"","station":"","count":0},"stop":{"job":""},"clear":{},"clear_caps":{},"download":{"job":"","chunk":0},"deauth":{"job":"","bssid":"","station":"","count":0}}'
+		exit
+		;;
+esac
+mkdir -m 700 -p "$state" || exit 1
+exec 9>"$state/lock"
+case "$1:$2" in
+	recheck:)
+		flock -n 9 || exit 1
+		work=$(cat "$state/current" 2>/dev/null)
+		case "$work" in "$state"/job.*) ;; *) exit 0;; esac
+		bssid=$(cat "$work/bssid")
+		verify_capture
+		;;
+	call:status)
+		json_init
+		running=0
+		if ! flock -n 9; then running=1; fi
+		json_add_string interfaces "$(iw dev)"
+		json_add_object radios
+		for phy in /sys/class/ieee80211/*; do
+			[ -d "$phy" ] || continue
+			name=${phy##*/}
+			driver=$(readlink "$phy/device/driver" 2>/dev/null)
+			json_add_object "$name"
+			json_add_string driver "${driver##*/}"
+			json_add_string hardware "$(cat "$phy/device/vendor" "$phy/device/device" 2>/dev/null | tr '\n' ' ')"
+			json_add_string modes "$(iw phy "$name" info | awk '/Supported interface modes:/ { found=1; next } found && /^[[:space:]]*\*/ { print $2; next } found { exit }')"
+			json_close_object
+		done
+		json_close_object
+		if [ "$running" -eq 0 ]; then
+			json_add_boolean active 0
+		else
+			json_add_boolean active 1
+		fi
+		work=$(cat "$state/current" 2>/dev/null)
+		if [ -n "$work" ]; then
+			[ "$running" -eq 0 ] || [ ! -f "$work/stop" ] || json_add_boolean stopping 1
+			add_file mode "$work/mode"
+			[ ! -f "$work/restoring" ] || json_add_boolean restoring 1
+			add_file capture_bssid "$work/bssid"
+			json_add_string job "${work##*/}"
+			if [ -f "$work/accept-deauth" ] && [ ! -f "$work/deauth-request" ]; then
+				json_add_boolean accepts_deauth 1
+			fi
+			if [ -s "$work/capture-01.csv" ] && [ "$(cat "$work/mode")" = capture ]; then
+				add_file live_csv "$work/capture-01.csv"
+			fi
+			add_file result "$work/result"
+			if [ "$(cat "$work/mode" 2>/dev/null)" = survey ] && [ -s "$work/capture-01.csv" ]; then
+				add_file csv "$work/capture-01.csv"
+			else
+				add_file csv "$state/survey"
+			fi
+			add_file details "$state/details" 65536
+			add_file wps "$state/wps"
+			add_file error "$work/error"
+			add_file capture_error "$work/capture-error" 2048
+			add_file monitor "$work/monitor" 8192
+			add_file replay "$work/replay" 8192
+			add_file verification "$work/verification"
+			[ ! -f "$work/handshake" ] || json_add_boolean handshake 1
+			if [ "$(cat "$work/mode")" != survey ] && [ -s "$work/capture-01.cap" ]; then
+				json_add_string capture "$work/capture-01.cap"
+				json_add_string capture_job "${work##*/}"
+				json_add_int capture_size "$(wc -c < "$work/capture-01.cap")"
+			fi
+		fi
+		json_dump
+		;;
+	call:deauth)
+		read -r input
+		json_load "$input" || { reply error 'Неверный запрос'; exit; }
+		json_get_vars job bssid station count
+		mac "$bssid" && { [ "$station" = all ] || mac "$station"; } ||
+			{ reply error 'Неверный BSSID или MAC клиента'; exit; }
+		case "$count" in 1|2|3|4|5|6|7|8|9|10) ;; *) reply error 'Допустимо от 1 до 10 серий'; exit;; esac
+		work=$(cat "$state/current" 2>/dev/null)
+		case "$work" in "$state"/job.*) ;; *) reply error 'Нет активного захвата'; exit;; esac
+		bssid=$(printf '%s' "$bssid" | tr A-F a-f)
+		station=$(printf '%s' "$station" | tr A-F a-f)
+		[ "$job" = "${work##*/}" ] && [ ! -f "$work/stop" ] && [ -f "$work/accept-deauth" ] &&
+			[ "$bssid" = "$(cat "$work/bssid")" ] ||
+			{ reply error 'Активный захват для этой точки недоступен'; exit; }
+		# Publish a complete request atomically, with at most one per capture.
+		pending=$(mktemp "$work/request.XXXXXX") || { reply error 'Захват завершён'; exit; }
+		if printf '%s %s\n' "$station" "$count" > "$pending" && ln "$pending" "$work/deauth-request" 2>/dev/null; then
+			reply message 'Запрос deauth поставлен в очередь'
+		else
+			reply error 'Запрос уже отправлен или захват завершён'
+		fi
+		rm -f "$pending"
+		;;
+	call:download)
+		read -r input
+		json_load "$input" || { reply error 'Неверный запрос'; exit; }
+		json_get_vars job chunk
+		flock -n 9 || { reply error 'Дождитесь окончания захвата'; exit; }
+		work=$(cat "$state/current" 2>/dev/null)
+		case "$work" in "$state"/job.*) ;; *) reply error 'Нет сохранённого CAP'; exit;; esac
+		case "$chunk" in ''|*[!0-9]*) reply error 'Неверный номер блока'; exit;; esac
+		[ "$job" = "${work##*/}" ] && [ "$chunk" -lt 1024 ] && [ -s "$work/capture-01.cap" ] ||
+			{ reply error 'Файл захвата недоступен'; exit; }
+		reply data "$(dd if="$work/capture-01.cap" bs=24576 skip="$chunk" count=1 2>/dev/null | base64 | tr -d '\n')"
+		;;
+	call:stop)
+		read -r input
+		json_load "$input" || { reply error 'Неверный запрос'; exit; }
+		json_get_var job job
+		if flock -n 9; then reply error 'Операция уже завершена'; exit; fi
+		work=$(cat "$state/current" 2>/dev/null)
+		case "$work" in "$state"/job.*) ;; *) reply error 'Нет активной операции'; exit;; esac
+		[ "$job" = "${work##*/}" ] && [ -d "$work" ] ||
+			{ reply error 'Эта операция уже завершена'; exit; }
+		: > "$work/stop" || { reply error 'Эта операция уже завершена'; exit; }
+		reply message 'Запрошена остановка'
+		;;
+	call:clear_caps)
+		flock -n 9 || { reply error 'Сначала остановите захват'; exit; }
+		find "$state" -mindepth 2 -maxdepth 2 -type f -name '*.cap' -exec rm -- {} + ||
+			{ reply error 'Не удалось удалить файлы CAP'; exit; }
+		work=$(cat "$state/current" 2>/dev/null)
+		case "$work" in "$state"/job.*) rm -f "$work/handshake" "$work/verification";; esac
+		reply message 'Файлы CAP удалены'
+		;;
+	call:clear)
+		flock -n 9 || { reply error 'Сначала остановите текущую операцию'; exit; }
+		for dir in "$state"/job.*; do
+			[ -d "$dir" ] && [ ! -L "$dir" ] || continue
+			find "$dir" -maxdepth 1 -type f -exec rm -- {} + && rmdir "$dir" ||
+				{ reply error 'Не удалось удалить данные операции'; exit; }
+		done
+		rm -f "$state/current" "$state/survey" "$state/details" "$state/wps"
+		reply message 'Данные удалены'
+		;;
+	call:start)
+		read -r input
+		json_load "$input" || { reply error 'Неверный запрос'; exit; }
+		json_get_vars iface mode band seconds channel bssid station count
+		flock -n 9 || { reply error 'Операция уже запущена'; exit; }
+		case "$mode" in survey|details|capture|deauth) ;; *) reply error 'Неизвестная операция'; exit;; esac
+		case "$iface" in ''|*[!a-zA-Z0-9_-]*) reply error 'Неверный интерфейс'; exit;; esac
+		original_info=$(iw dev "$iface" info 2>/dev/null)
+		original_type=$(printf '%s\n' "$original_info" | sed -n 's/^[[:space:]]*type //p')
+		original_channel=$(printf '%s\n' "$original_info" | awk '$1=="channel" {print $2}')
+		original_mac=$(printf '%s\n' "$original_info" | awk '$1=="addr" {print $2}')
+		[ -n "$original_type" ] || { reply error 'Интерфейс отсутствует'; exit; }
+		case "$band" in bg|a|abg) ;; *) reply error 'Неверный диапазон'; exit;; esac
+		if [ "$mode" = survey ]; then
+			case "$seconds" in ''|*[!0-9]*) seconds=0;; esac
+			[ "$seconds" -ge 5 ] && [ "$seconds" -le 120 ] || { reply error 'Длительность от 5 до 120 секунд'; exit; }
+		else
+			seconds=0
+		fi
+		if [ "$mode" != details ]; then
+			case "$original_type" in AP|managed) ;; *) reply error 'Для запуска airmon-ng выберите AP или managed'; exit;; esac
+			[ "${#iface}" -le 12 ] && ! iw dev "${iface}mon" info >/dev/null 2>&1 ||
+				{ reply error 'Имя monitor-интерфейса занято или превышает допустимую длину'; exit; }
+			if [ "$original_type" = AP ]; then
+				wireless=$(ubus call network.wireless status)
+				for name in $(uci show wireless | sed -n 's/^wireless\.\([a-zA-Z0-9_]*\)=wifi-device$/\1/p'); do
+					jsonfilter -s "$wireless" -e "@.$name.interfaces[*].ifname" | grep -Fxq "$iface" &&
+						{ radio=$name; break; }
+				done
+				[ -n "$radio" ] || { reply error 'Интерфейс AP не сопоставлен с радио OpenWrt'; exit; }
+			fi
+		else
+			case "$original_type" in AP|managed|mesh\ point|P2P-client|P2P-GO|P2P-device) ;;
+				*) reply error 'Пассивный скан iw недоступен для этого типа интерфейса'; exit;;
+			esac
+		fi
+		case "$mode" in
+			capture|deauth)
+				case "$channel" in ''|*[!0-9]*) channel=0;; esac
+				[ "$channel" -ge 1 ] && [ "$channel" -le 196 ] && mac "$bssid" ||
+					{ reply error 'Нужны канал и корректный BSSID'; exit; }
+				bssid=$(printf '%s' "$bssid" | tr A-F a-f)
+				;;
+			*) channel= ;;
+		esac
+		if [ "$mode" = deauth ]; then
+			[ "$station" = all ] || mac "$station" || { reply error 'Выберите клиента или все клиенты'; exit; }
+			station=$(printf '%s' "$station" | tr A-F a-f)
+			case "$count" in 1|2|3|4|5|6|7|8|9|10) ;; *) reply error 'Допустимо от 1 до 10 серий'; exit;; esac
+		else
+			station=
+		fi
+		# Keep the latest job only, including the CAP, to cap temporary storage.
+		old=$(cat "$state/current" 2>/dev/null)
+		case "$old" in "$state"/job.*)
+			if [ ! -L "$old" ] && [ -d "$old" ]; then
+				find "$old" -maxdepth 1 -type f -exec rm -- {} + && rmdir "$old" ||
+					{ reply error 'Не удалось удалить файлы предыдущей операции'; exit; }
+			fi
+			;;
+		esac
+		rm -f "$state/current"
+		(run) </dev/null >/dev/null 2>&1 &
+		reply message 'Операция запущена'
+		;;
+	*) reply error 'Неизвестный метод';;
+esac

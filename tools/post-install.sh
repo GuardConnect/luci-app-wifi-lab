@@ -1,0 +1,5 @@
+#!/bin/sh
+[ -z "$IPKG_INSTROOT" ] || exit 0
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+/etc/init.d/rpcd reload
+exit 0

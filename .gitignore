@@ -1,0 +1,10 @@
+*.apk
+*.cap
+*.pcap
+*.pcapng
+*.log
+*.zip
+SHA256SUMS
+.env
+.env.*
+.preview/

@@ -1,0 +1,7 @@
+{
+  "luci-app-wifi-lab": {
+    "description": "Wi-Fi Lab status and test operations",
+    "read": { "ubus": { "luci.wifilab": ["status", "download"] } },
+    "write": { "ubus": { "luci.wifilab": ["start", "stop", "clear", "clear_caps", "deauth"] } }
+  }
+}
